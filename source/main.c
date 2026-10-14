@@ -1,5 +1,6 @@
 /* Battle City - standalone Switch homebrew (NRO). ROM is embedded. */
 #include <switch.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "nes.h"

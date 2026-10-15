@@ -45,6 +45,245 @@ static uint8_t  rA, rX, rY, rSP;
 static uint8_t  fc, fz, fi, fd, fv, fn;
 static int      cpu_stall;
 
+static void apu_write(uint16_t a, uint8_t d);
+static uint8_t apu_status(void);
+static void apu_reset(void);
+
+
+/* ============================================================ APU */
+static const uint8_t len_table[32] = {
+    10,254,20,2,40,4,80,6,160,8,60,10,14,12,26,14,
+    12,16,24,18,48,20,96,22,192,24,72,26,16,28,32,30
+};
+static const uint8_t duty_table[4][8] = {
+    {0,1,0,0,0,0,0,0},{0,1,1,0,0,0,0,0},{0,1,1,1,1,0,0,0},{1,0,0,1,1,1,1,1}
+};
+static const uint16_t noise_table[16] = {
+    4,8,16,32,64,96,128,160,202,254,380,508,762,1016,2034,4068
+};
+static const uint8_t tri_table[32] = {
+    15,14,13,12,11,10,9,8,7,6,5,4,3,2,1,0,
+    0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+};
+
+typedef struct { int start, loop, constant, vol, div, decay; } Env;
+typedef struct {
+    Env env; int enabled, duty, step, len, period, timer;
+    int sw_en, sw_period, sw_neg, sw_shift, sw_reload, sw_div;
+} Pulse;
+typedef struct {
+    int enabled, control, reload_val, reload, linear, len, period, timer, step;
+} Tri;
+typedef struct {
+    Env env; int enabled, len, mode, pidx, timer; uint16_t shift;
+} Noise;
+
+static Pulse sq[2];
+static Tri   tri;
+static Noise noi;
+static int   fc_mode, fc_cycle, apu_odd;
+static long  sample_timer;
+static float acc_sum; static int acc_n;
+static float hp_prev_in, hp_prev_out;
+
+#define ABUF_SIZE 16384
+static int16_t abuf[ABUF_SIZE];
+static int a_head, a_tail;
+
+#define CPU_HZ 1789773
+#define OUT_HZ 48000
+
+static void env_clock(Env *e)
+{
+    if (e->start) { e->start = 0; e->decay = 15; e->div = e->vol; }
+    else if (e->div == 0) {
+        e->div = e->vol;
+        if (e->decay > 0) e->decay--; else if (e->loop) e->decay = 15;
+    } else e->div--;
+}
+static int env_out(Env *e) { return e->constant ? e->vol : e->decay; }
+
+static int sweep_target(Pulse *p, int ch)
+{
+    int change = p->period >> p->sw_shift;
+    if (p->sw_neg) return p->period - change - (ch == 0 ? 1 : 0);
+    return p->period + change;
+}
+static int pulse_muted(Pulse *p, int ch)
+{
+    return p->period < 8 || sweep_target(p, ch) > 0x7FF;
+}
+static void sweep_clock(Pulse *p, int ch)
+{
+    if (p->sw_div == 0 && p->sw_en && p->sw_shift && !pulse_muted(p, ch))
+        p->period = sweep_target(p, ch);
+    if (p->sw_div == 0 || p->sw_reload) { p->sw_div = p->sw_period; p->sw_reload = 0; }
+    else p->sw_div--;
+}
+
+static void quarter_clock(void)
+{
+    env_clock(&sq[0].env); env_clock(&sq[1].env); env_clock(&noi.env);
+    if (tri.reload) tri.linear = tri.reload_val;
+    else if (tri.linear > 0) tri.linear--;
+    if (!tri.control) tri.reload = 0;
+}
+static void half_clock(void)
+{
+    int i;
+    for (i = 0; i < 2; i++) {
+        if (!sq[i].env.loop && sq[i].len > 0) sq[i].len--;
+        sweep_clock(&sq[i], i);
+    }
+    if (!tri.control && tri.len > 0) tri.len--;
+    if (!noi.env.loop && noi.len > 0) noi.len--;
+}
+
+static void frame_step(void)
+{
+    fc_cycle++;
+    if (fc_cycle == 3729) quarter_clock();
+    else if (fc_cycle == 7457) { quarter_clock(); half_clock(); }
+    else if (fc_cycle == 11186) quarter_clock();
+    else if (!fc_mode && fc_cycle == 14915) { quarter_clock(); half_clock(); fc_cycle = 0; }
+    else if (fc_mode && fc_cycle == 18641) { quarter_clock(); half_clock(); fc_cycle = 0; }
+}
+
+static void pulse_tick(Pulse *p)
+{
+    if (p->timer == 0) { p->timer = p->period; p->step = (p->step + 1) & 7; }
+    else p->timer--;
+}
+
+static int pulse_out(Pulse *p, int ch)
+{
+    if (!p->enabled || p->len == 0 || pulse_muted(p, ch)) return 0;
+    if (!duty_table[p->duty][p->step]) return 0;
+    return env_out(&p->env);
+}
+
+static float apu_mix(void)
+{
+    int p1 = pulse_out(&sq[0], 0), p2 = pulse_out(&sq[1], 1);
+    int t = tri_table[tri.step];
+    int n = (noi.enabled && noi.len > 0 && !(noi.shift & 1)) ? env_out(&noi.env) : 0;
+    float pout = 0.0f, tout = 0.0f, tnd;
+    if (p1 + p2) pout = 95.88f / (8128.0f / (p1 + p2) + 100.0f);
+    tnd = t / 8227.0f + n / 12241.0f;
+    if (tnd > 0.0f) tout = 159.79f / (1.0f / tnd + 100.0f);
+    return pout + tout;
+}
+
+static void apu_push(int16_t v)
+{
+    int next = (a_head + 1) % ABUF_SIZE;
+    if (next == a_tail) return; /* full: drop */
+    abuf[a_head] = v;
+    a_head = next;
+}
+
+static void apu_run(int cycles)
+{
+    while (cycles--) {
+        frame_step();
+        if (apu_odd) { pulse_tick(&sq[0]); pulse_tick(&sq[1]); }
+        apu_odd ^= 1;
+        if (tri.timer == 0) {
+            tri.timer = tri.period;
+            if (tri.len > 0 && tri.linear > 0 && tri.period >= 2) tri.step = (tri.step + 1) & 31;
+        } else tri.timer--;
+        if (noi.timer == 0) {
+            int fb;
+            noi.timer = noise_table[noi.pidx] - 1;
+            fb = (noi.shift & 1) ^ ((noi.shift >> (noi.mode ? 6 : 1)) & 1);
+            noi.shift = (noi.shift >> 1) | (fb << 14);
+        } else noi.timer--;
+
+        acc_sum += apu_mix(); acc_n++;
+        sample_timer += OUT_HZ;
+        if (sample_timer >= CPU_HZ) {
+            float x, y;
+            sample_timer -= CPU_HZ;
+            x = acc_sum / acc_n; acc_sum = 0; acc_n = 0;
+            y = x - hp_prev_in + 0.995f * hp_prev_out; /* remove DC */
+            hp_prev_in = x; hp_prev_out = y;
+            y *= 20000.0f;
+            if (y > 32767.0f) y = 32767.0f;
+            if (y < -32768.0f) y = -32768.0f;
+            apu_push((int16_t)y);
+        }
+    }
+}
+
+static void apu_write(uint16_t a, uint8_t d)
+{
+    Pulse *p = &sq[(a >> 2) & 1];
+    switch (a) {
+    case 0x4000: case 0x4004:
+        p->duty = d >> 6; p->env.loop = (d >> 5) & 1;
+        p->env.constant = (d >> 4) & 1; p->env.vol = d & 15; break;
+    case 0x4001: case 0x4005:
+        p->sw_en = d >> 7; p->sw_period = (d >> 4) & 7;
+        p->sw_neg = (d >> 3) & 1; p->sw_shift = d & 7; p->sw_reload = 1; break;
+    case 0x4002: case 0x4006: p->period = (p->period & 0x700) | d; break;
+    case 0x4003: case 0x4007:
+        p->period = (p->period & 0xFF) | ((d & 7) << 8);
+        if (p->enabled) p->len = len_table[d >> 3];
+        p->step = 0; p->env.start = 1; break;
+    case 0x4008: tri.control = d >> 7; tri.reload_val = d & 0x7F; break;
+    case 0x400A: tri.period = (tri.period & 0x700) | d; break;
+    case 0x400B:
+        tri.period = (tri.period & 0xFF) | ((d & 7) << 8);
+        if (tri.enabled) tri.len = len_table[d >> 3];
+        tri.reload = 1; break;
+    case 0x400C:
+        noi.env.loop = (d >> 5) & 1; noi.env.constant = (d >> 4) & 1;
+        noi.env.vol = d & 15; break;
+    case 0x400E: noi.mode = d >> 7; noi.pidx = d & 15; break;
+    case 0x400F:
+        if (noi.enabled) noi.len = len_table[d >> 3];
+        noi.env.start = 1; break;
+    case 0x4015:
+        sq[0].enabled = d & 1; sq[1].enabled = (d >> 1) & 1;
+        tri.enabled = (d >> 2) & 1; noi.enabled = (d >> 3) & 1;
+        if (!sq[0].enabled) sq[0].len = 0;
+        if (!sq[1].enabled) sq[1].len = 0;
+        if (!tri.enabled) tri.len = 0;
+        if (!noi.enabled) noi.len = 0;
+        break;
+    case 0x4017:
+        fc_mode = (d >> 7) & 1; fc_cycle = 0;
+        if (fc_mode) { quarter_clock(); half_clock(); }
+        break;
+    default: break;
+    }
+}
+
+static uint8_t apu_status(void)
+{
+    return (sq[0].len > 0) | ((sq[1].len > 0) << 1) |
+           ((tri.len > 0) << 2) | ((noi.len > 0) << 3);
+}
+
+static void apu_reset(void)
+{
+    memset(sq, 0, sizeof(sq)); memset(&tri, 0, sizeof(tri)); memset(&noi, 0, sizeof(noi));
+    noi.shift = 1;
+    fc_mode = fc_cycle = apu_odd = 0;
+    sample_timer = 0; acc_sum = 0; acc_n = 0; hp_prev_in = hp_prev_out = 0;
+    a_head = a_tail = 0;
+}
+
+size_t nes_get_audio(int16_t *dst, size_t max)
+{
+    size_t n = 0;
+    while (n < max && a_tail != a_head) {
+        dst[n++] = abuf[a_tail];
+        a_tail = (a_tail + 1) % ABUF_SIZE;
+    }
+    return n;
+}
+
 /* ============================================================ PPU bus */
 static int nt_index(uint16_t a)
 {
@@ -143,6 +382,7 @@ static uint8_t rd(uint16_t a)
 {
     if (a < 0x2000) return ram[a & 0x7FF];
     if (a < 0x4000) return ppu_reg_rd(a & 7);
+    if (a == 0x4015) return apu_status();
     if (a == 0x4016) {
         uint8_t r;
         if (pad_strobe) return (pad_state & 1) | 0x40;
@@ -172,6 +412,7 @@ static void wr(uint16_t a, uint8_t d)
         else pad_shift = pad_state;
         return;
     }
+    if (a >= 0x4000 && a <= 0x4017) { apu_write(a, d); return; }
     if (a >= 0x6000 && a < 0x8000) prg_ram[a - 0x6000] = d;
 }
 
@@ -410,6 +651,7 @@ static int do_nmi(void)
     return 7;
 }
 
+
 /* ============================================================ PPU render */
 static void render_scanline(int sl)
 {
@@ -527,6 +769,7 @@ void nes_reset(void)
     rA = rX = rY = 0; rSP = 0xFD;
     set_p(0x24);
     cpu_stall = 0;
+    apu_reset();
     pc = rd16(0xFFFC);
 }
 
@@ -552,6 +795,7 @@ void nes_run_frame(void)
             int c;
             if (nmi_pending) { nmi_pending = 0; c = do_nmi(); }
             else c = cpu_step();
+            apu_run(c);
             budget -= c * 3;
         }
         if ((sl < 240 || sl == 261) && (ppu_mask & 0x18)) {

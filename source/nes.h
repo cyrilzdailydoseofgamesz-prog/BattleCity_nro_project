@@ -26,4 +26,10 @@ void nes_reset(void);
 void nes_set_pad(uint8_t state);
 void nes_run_frame(void);
 
+/* mono signed 16-bit samples at 48000 Hz; returns number copied */
+size_t nes_get_audio(int16_t *dst, size_t max);
+
+/* stereo interleaved int16, n frames of audio at 'rate' Hz (call once per video frame) */
+void nes_apu_mix(int16_t *out, int n, int rate);
+
 #endif

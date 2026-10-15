@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <malloc.h>
 #include "nes.h"
 
 extern const uint8_t rom_data[];
@@ -12,6 +13,86 @@ extern const size_t  rom_size;
 #define OUT_W   (NES_WIDTH * SCALE)
 #define X_OFF   ((1280 - OUT_W) / 2)
 
+/* ---------------------------------------------------------------- audio */
+#define ABUF_COUNT  4
+#define ABUF_FRAMES 1024                       /* stereo frames per buffer */
+#define ABUF_BYTES  (ABUF_FRAMES * 2 * sizeof(s16))   /* 4096, page aligned */
+#define FIFO_MAX    3072
+
+static AudioOutBuffer abuf[ABUF_COUNT];
+static s16 *adata[ABUF_COUNT];
+static AudioOutBuffer *free_list[ABUF_COUNT];
+static int free_n;
+static AudioOutBuffer *sub_q[ABUF_COUNT];      /* submitted, in play order */
+static int sub_head, sub_n;
+static s16 fifo[FIFO_MAX + 2048];
+static int fifo_n;
+static int audio_ok;
+
+static void audio_init(void)
+{
+    int i;
+    if (R_FAILED(audoutInitialize())) return;
+    if (R_FAILED(audoutStartAudioOut())) { audoutExit(); return; }
+    for (i = 0; i < ABUF_COUNT; i++) {
+        adata[i] = (s16 *)memalign(0x1000, ABUF_BYTES);
+        memset(adata[i], 0, ABUF_BYTES);
+        memset(&abuf[i], 0, sizeof(abuf[i]));
+        abuf[i].buffer      = adata[i];
+        abuf[i].buffer_size = ABUF_BYTES;
+        abuf[i].data_size   = ABUF_BYTES;
+        abuf[i].data_offset = 0;
+        free_list[free_n++] = &abuf[i];
+    }
+    audio_ok = 1;
+}
+
+static void audio_pump(void)
+{
+    s16 tmp[2048];
+    size_t got = nes_get_audio(tmp, 2048);
+    AudioOutBuffer *rel = NULL;
+    u32 cnt = 0;
+
+    if (!audio_ok) return;
+
+    /* recycle buffers the console finished playing (they finish in order) */
+    while (R_SUCCEEDED(audoutGetReleasedAudioOutBuffer(&rel, &cnt)) && cnt > 0) {
+        u32 k;
+        for (k = 0; k < cnt && sub_n > 0; k++) {
+            free_list[free_n++] = sub_q[sub_head];
+            sub_head = (sub_head + 1) % ABUF_COUNT;
+            sub_n--;
+        }
+        cnt = 0;
+    }
+
+    if (fifo_n + (int)got > FIFO_MAX) got = (size_t)(FIFO_MAX - fifo_n); /* keep latency low */
+    memcpy(&fifo[fifo_n], tmp, got * sizeof(s16));
+    fifo_n += (int)got;
+
+    while (fifo_n >= ABUF_FRAMES && free_n > 0) {
+        AudioOutBuffer *b = free_list[--free_n];
+        s16 *o = (s16 *)b->buffer;
+        int i;
+        for (i = 0; i < ABUF_FRAMES; i++) o[2 * i] = o[2 * i + 1] = fifo[i];
+        b->data_size = ABUF_BYTES;
+        audoutAppendAudioOutBuffer(b);
+        sub_q[(sub_head + sub_n) % ABUF_COUNT] = b;
+        sub_n++;
+        memmove(fifo, fifo + ABUF_FRAMES, (fifo_n - ABUF_FRAMES) * sizeof(s16));
+        fifo_n -= ABUF_FRAMES;
+    }
+}
+
+static void audio_exit(void)
+{
+    if (!audio_ok) return;
+    audoutStopAudioOut();
+    audoutExit();
+}
+
+/* ---------------------------------------------------------------- input */
 static uint8_t map_buttons(u64 k)
 {
     uint8_t s = 0;
@@ -49,6 +130,8 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    audio_init();
+
     win = nwindowGetDefault();
     framebufferCreate(&fb, win, 1280, 720, PIXEL_FORMAT_RGBA_8888, 2);
     framebufferMakeLinear(&fb);
@@ -64,6 +147,7 @@ int main(int argc, char **argv)
 
         nes_set_pad(map_buttons(held));
         nes_run_frame();
+        audio_pump();
 
         out = (u32 *)framebufferBegin(&fb, &stride);
         if (frame < 3) {
@@ -86,6 +170,7 @@ int main(int argc, char **argv)
         frame++;
     }
 
+    audio_exit();
     framebufferClose(&fb);
     return 0;
 }

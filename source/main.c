@@ -93,37 +93,73 @@ static void audio_exit(void)
 }
 
 /* ---------------------------------------------------------------- input */
-static uint8_t map_buttons(u64 k)
+#define DEADZONE 12000
+
+/* Maps one controller to NES buttons.
+ * Works for: handheld, Pro Controller, Joy-Con pair (dual), and a SINGLE
+ * Joy-Con held sideways (set up with Home > Controllers > Change Grip/Order). */
+static uint8_t map_pad(PadState *p)
 {
+    u64 k = padGetButtons(p);
+    u32 style = padGetStyleSet(p);
+    HidAnalogStickState st;
     uint8_t s = 0;
-    if (k & (HidNpadButton_A | HidNpadButton_X))     s |= NES_A;
-    if (k & (HidNpadButton_B | HidNpadButton_Y))     s |= NES_B;
-    if (k & HidNpadButton_Minus)                     s |= NES_SELECT;
-    if (k & HidNpadButton_Plus)                      s |= NES_START;
-    if (k & (HidNpadButton_Up | HidNpadButton_StickLUp))       s |= NES_UP;
-    if (k & (HidNpadButton_Down | HidNpadButton_StickLDown))   s |= NES_DOWN;
-    if (k & (HidNpadButton_Left | HidNpadButton_StickLLeft))   s |= NES_LEFT;
-    if (k & (HidNpadButton_Right | HidNpadButton_StickLRight)) s |= NES_RIGHT;
+    int x, y;
+
+    if (style & HidNpadStyleTag_NpadJoyLeft) {
+        /* left Joy-Con sideways: rail on top, stick on the left */
+        st = padGetStickPos(p, 0);
+        x = -st.y; y = st.x;
+        if (k & (HidNpadButton_Up | HidNpadButton_Down | HidNpadButton_Left | HidNpadButton_Right)) s |= NES_A;
+        if (k & (HidNpadButton_LeftSL | HidNpadButton_LeftSR)) s |= NES_B;
+        if (k & HidNpadButton_Minus) s |= NES_START;
+        if (k & (HidNpadButton_L | HidNpadButton_ZL)) s |= NES_SELECT;
+    } else if (style & HidNpadStyleTag_NpadJoyRight) {
+        /* right Joy-Con sideways: rail on top, stick on the right */
+        st = padGetStickPos(p, 1);
+        x = st.y; y = -st.x;
+        if (k & (HidNpadButton_A | HidNpadButton_B | HidNpadButton_X | HidNpadButton_Y)) s |= NES_A;
+        if (k & (HidNpadButton_RightSL | HidNpadButton_RightSR)) s |= NES_B;
+        if (k & HidNpadButton_Plus) s |= NES_START;
+        if (k & (HidNpadButton_R | HidNpadButton_ZR)) s |= NES_SELECT;
+    } else {
+        st = padGetStickPos(p, 0);
+        x = st.x; y = st.y;
+        if (k & (HidNpadButton_A | HidNpadButton_X)) s |= NES_A;
+        if (k & (HidNpadButton_B | HidNpadButton_Y)) s |= NES_B;
+        if (k & HidNpadButton_Minus) s |= NES_SELECT;
+        if (k & HidNpadButton_Plus)  s |= NES_START;
+        if (k & HidNpadButton_Up)    s |= NES_UP;
+        if (k & HidNpadButton_Down)  s |= NES_DOWN;
+        if (k & HidNpadButton_Left)  s |= NES_LEFT;
+        if (k & HidNpadButton_Right) s |= NES_RIGHT;
+    }
+    if (y >  DEADZONE) s |= NES_UP;
+    if (y < -DEADZONE) s |= NES_DOWN;
+    if (x < -DEADZONE) s |= NES_LEFT;
+    if (x >  DEADZONE) s |= NES_RIGHT;
     return s;
 }
 
 int main(int argc, char **argv)
 {
     Framebuffer fb;
-    PadState pad;
+    PadState pad1, pad2;
     NWindow *win;
     u32 line[OUT_W];
     int frame = 0;
 
-    padConfigureInput(1, HidNpadStyleSet_NpadStandard);
-    padInitializeDefault(&pad);
+    padConfigureInput(2, HidNpadStyleSet_NpadStandard);
+    hidSetNpadJoyHoldType(HidNpadJoyHoldType_Vertical); /* raw Joy-Con input; sideways is handled in map_pad() */
+    padInitialize(&pad1, HidNpadIdType_No1, HidNpadIdType_Handheld);
+    padInitialize(&pad2, HidNpadIdType_No2);
 
     if (nes_load(rom_data, rom_size) != 0) {
         consoleInit(NULL);
         printf("ROM failed to load.\nPress + to exit.\n");
         while (appletMainLoop()) {
-            padUpdate(&pad);
-            if (padGetButtonsDown(&pad) & HidNpadButton_Plus) break;
+            padUpdate(&pad1);
+            if (padGetButtonsDown(&pad1) & HidNpadButton_Plus) break;
             consoleUpdate(NULL);
         }
         consoleExit(NULL);
@@ -141,11 +177,13 @@ int main(int argc, char **argv)
         int y, x;
         u64 held;
 
-        padUpdate(&pad);
-        held = padGetButtons(&pad);
+        padUpdate(&pad1);
+        padUpdate(&pad2);
+        held = padGetButtons(&pad1) | padGetButtons(&pad2);
         if ((held & HidNpadButton_L) && (held & HidNpadButton_R)) break; /* L+R quits */
 
-        nes_set_pad(map_buttons(held));
+        nes_set_pad(map_pad(&pad1));
+        nes_set_pad2(map_pad(&pad2));
         nes_run_frame();
         audio_pump();
 

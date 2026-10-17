@@ -23,7 +23,8 @@ extern uint32_t nes_fb[NES_WIDTH * NES_HEIGHT];
 /* returns 0 on success, -1 bad header, -2 unsupported mapper, -3 truncated */
 int  nes_load(const uint8_t *data, size_t size);
 void nes_reset(void);
-void nes_set_pad(uint8_t state);
+void nes_set_pad(uint8_t state);    /* player 1 */
+void nes_set_pad2(uint8_t state);   /* player 2 */
 void nes_run_frame(void);
 
 /* mono signed 16-bit samples at 48000 Hz; returns number copied */

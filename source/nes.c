@@ -38,6 +38,7 @@ static int      nmi_pending;
 
 /* ------------------------------------------------------------ input */
 static uint8_t pad_state, pad_shift, pad_strobe;
+static uint8_t pad2_state, pad2_shift;
 
 /* ------------------------------------------------------------ CPU state */
 static uint16_t pc;
@@ -390,6 +391,13 @@ static uint8_t rd(uint16_t a)
         pad_shift = (pad_shift >> 1) | 0x80;
         return r | 0x40;
     }
+    if (a == 0x4017) {                       /* controller 2 */
+        uint8_t r;
+        if (pad_strobe) return (pad2_state & 1) | 0x40;
+        r = pad2_shift & 1;
+        pad2_shift = (pad2_shift >> 1) | 0x80;
+        return r | 0x40;
+    }
     if (a >= 0x8000) return prg[(a - 0x8000) & (prg_size - 1)];
     if (a >= 0x6000) return prg_ram[a - 0x6000];
     return 0;
@@ -408,8 +416,8 @@ static void wr(uint16_t a, uint8_t d)
     }
     if (a == 0x4016) {
         pad_strobe = d & 1;
-        if (pad_strobe) pad_shift = pad_state;
-        else pad_shift = pad_state;
+        pad_shift = pad_state;               /* latch both controllers */
+        pad2_shift = pad2_state;
         return;
     }
     if (a >= 0x4000 && a <= 0x4017) { apu_write(a, d); return; }
@@ -766,6 +774,7 @@ void nes_reset(void)
     ppu_ctrl = ppu_mask = ppu_status = oam_addr = read_buf = 0;
     vreg = treg = 0; fine_x = wtoggle = 0; nmi_pending = 0;
     pad_state = pad_shift = pad_strobe = 0;
+    pad2_state = pad2_shift = 0;
     rA = rX = rY = 0; rSP = 0xFD;
     set_p(0x24);
     cpu_stall = 0;
@@ -774,6 +783,7 @@ void nes_reset(void)
 }
 
 void nes_set_pad(uint8_t s) { pad_state = s; }
+void nes_set_pad2(uint8_t s) { pad2_state = s; }
 
 void nes_run_frame(void)
 {
